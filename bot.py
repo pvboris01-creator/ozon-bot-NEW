@@ -14,8 +14,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from ozon_perf import (
     get_campaigns,
     get_daily_stats,
+    get_product_stats,
+    get_campaign_skus,
+    set_campaign_bid,
     activate_campaign,
     deactivate_campaign,
+    get_balance,
 )
 
 load_dotenv()
@@ -34,6 +38,7 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
 PAGE_SIZE = 8
+BID_PAGE_SIZE = 6
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 THRESHOLDS = [500, 1000, 1500, 2000]
@@ -97,6 +102,10 @@ def get_limit(campaign_id: str) -> float:
 
 # ---------- FSM ----------
 class LimitForm(StatesGroup):
+    waiting_amount = State()
+
+
+class BidForm(StatesGroup):
     waiting_amount = State()
 
 
@@ -251,7 +260,49 @@ def format_limit_alert(campaign_name: str, campaign_id: str, limit: float, spent
     )
 
 
-# ---------- КЛАВИАТУРА: КАМПАНИИ ----------
+# ---------- МЕНЮ ----------
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="menu:stats")],
+        [InlineKeyboardButton(text="📋 Кампании", callback_data="menu:campaigns")],
+        [InlineKeyboardButton(text="💰 Настройка ставок", callback_data="menu:bids")],
+        [InlineKeyboardButton(text="💳 Баланс", callback_data="menu:balance")],
+    ])
+
+
+def balance_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Текущий баланс", callback_data="balance:current")],
+        [InlineKeyboardButton(text="📊 Расходы", callback_data="balance:expenses")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+    ])
+
+
+def balance_expenses_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 За сегодня", callback_data="balance_period:1")],
+        [InlineKeyboardButton(text="📊 За 7 дней", callback_data="balance_period:7")],
+        [InlineKeyboardButton(text="📈 За месяц", callback_data="balance_period:30")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
+    ])
+
+
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+    ])
+
+
+def stats_period_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 За 1 день", callback_data="stats_period:1")],
+        [InlineKeyboardButton(text="📊 За 7 дней", callback_data="stats_period:7")],
+        [InlineKeyboardButton(text="📈 За 30 дней", callback_data="stats_period:30")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+    ])
+
+
+# ---------- КАМПАНИИ ----------
 async def build_campaigns_keyboard(mode: str, page: int):
     try:
         campaigns = await get_campaigns()
@@ -311,18 +362,15 @@ async def build_campaigns_keyboard(mode: str, page: int):
             action = "on"
             hint = "▶️"
 
-        # Лимит рядом с расходом: "296.37 / 500 ₽" если лимит есть
         if limit > 0:
             text = f"{hint}{icon} {title} — {spent:,.2f} / {limit:,.0f} ₽"
         else:
             text = f"{hint}{icon} {title} — {spent:,.2f} ₽"
 
-        # Одна широкая кнопка на кампанию (действие: включить/выключить)
         buttons.append([
             InlineKeyboardButton(text=text[:64], callback_data=f"{action}:{cid}")
         ])
 
-    # Навигация по страницам
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="◀️", callback_data=f"pg:{mode}:{page-1}"))
@@ -335,14 +383,15 @@ async def build_campaigns_keyboard(mode: str, page: int):
         nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
     buttons.append(nav)
 
-    # Кнопка лимитов
+    buttons.append([InlineKeyboardButton(text="📈 Статистика кампаний", callback_data="stats_menu:0")])
     buttons.append([InlineKeyboardButton(text="⚙️ Настроить лимиты", callback_data="limits_menu:0")])
 
-    # Переключатель CPC/CPO
     if mode == "cpc":
         buttons.append([InlineKeyboardButton(text="💰 Оплата за заказ", callback_data="pg:cpo:0")])
     else:
         buttons.append([InlineKeyboardButton(text="💳 Оплата за клик", callback_data="pg:cpc:0")])
+
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")])
 
     label = "оплата за клик (CPC)" if mode == "cpc" else "оплата за заказ (CPO)"
     text = (
@@ -353,23 +402,18 @@ async def build_campaigns_keyboard(mode: str, page: int):
         f"📉 ДРР: {drr_today:.1f}%\n"
         f"──────────────\n"
         f"📋 <b>Кампании</b> ({label}) — найдено <b>{len(filtered)}</b>, "
-        f"страница {page+1}/{total_pages}\n\n"
-        f"▶️ — включить · ⏹ — выключить\n"
-        f"Сумма вида <code>296.37 / 500 ₽</code> = расход / лимит\n"
-        f"🟢 активные · 🟡 за последний месяц · ⚪ архив"
+        f"страница {page+1}/{total_pages}"
     )
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ---------- КЛАВИАТУРА: ЭКРАН ЛИМИТОВ ----------
+# ---------- ЛИМИТЫ ----------
 async def build_limits_keyboard(page: int):
-    """Отдельный экран для настройки лимитов."""
     try:
         campaigns = await get_campaigns()
     except Exception as e:
         return f"❌ Ошибка получения кампаний: {e}", None
 
-    # Показываем только CPC — как и основной список
     filtered = [c for c in campaigns if c.get("PaymentType") == "CPC"]
     now = datetime.now(timezone.utc)
     filtered.sort(key=lambda c: campaign_priority(c, now))
@@ -411,7 +455,8 @@ async def build_limits_keyboard(page: int):
         nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
     buttons.append(nav)
 
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад к кампаниям", callback_data="pg:cpc:0")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад к кампаниям", callback_data="menu:campaigns")])
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")])
 
     text = (
         f"⚙️ <b>Настройка дневных лимитов</b>\n\n"
@@ -421,6 +466,258 @@ async def build_limits_keyboard(page: int):
         f"Страница {page+1}/{total_pages}"
     )
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ---------- СТАТИСТИКА КАМПАНИЙ ----------
+async def build_stats_menu_keyboard(page: int):
+    try:
+        campaigns = await get_campaigns()
+    except Exception as e:
+        return f"❌ Ошибка получения кампаний: {e}", None
+
+    filtered = [c for c in campaigns if c.get("PaymentType") == "CPC"]
+    now = datetime.now(timezone.utc)
+    filtered.sort(key=lambda c: campaign_priority(c, now))
+
+    total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    chunk = filtered[start:start + PAGE_SIZE]
+
+    buttons = []
+    for c in chunk:
+        cid = str(c.get("id"))
+        title = c.get("title") or c.get("advObjectType") or "Кампания"
+        if len(title) > 28:
+            title = title[:25] + "..."
+        state = c.get("state")
+        icon = "🟢" if state == "CAMPAIGN_STATE_RUNNING" else "⚪"
+        text = f"{icon} {title}"
+        buttons.append([InlineKeyboardButton(text=text[:64], callback_data=f"stats:{cid}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"stats_menu:{page-1}"))
+    else:
+        nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"stats_menu:{page+1}"))
+    else:
+        nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
+    buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад к кампаниям", callback_data="menu:campaigns")])
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")])
+
+    text = (
+        f"📈 <b>Статистика кампаний</b>\n\n"
+        f"Выбери кампанию, чтобы посмотреть подробную статистику за сегодня.\n\n"
+        f"Страница {page+1}/{total_pages}"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def build_campaign_stats_view(campaign_id: str):
+    try:
+        campaigns = await get_campaigns()
+    except Exception as e:
+        return f"❌ Ошибка получения кампаний: {e}", None
+
+    campaign = next((c for c in campaigns if str(c.get("id")) == campaign_id), None)
+    if not campaign:
+        return f"❌ Кампания {campaign_id} не найдена.", None
+
+    name = campaign.get("title") or campaign.get("advObjectType") or "Кампания"
+    state = campaign.get("state")
+    today_str = datetime.now(MOSCOW_TZ).date().isoformat()
+
+    row = None
+    try:
+        rows = await get_product_stats(today_str, today_str, [campaign_id])
+        row = next((r for r in rows if str(r.get("id")) == campaign_id), None)
+    except Exception as e:
+        print(f"Не удалось получить статистику: {e}")
+
+    if row:
+        views = parse_int(row.get("views"))
+        clicks = parse_int(row.get("clicks"))
+        orders = parse_int(row.get("orders"))
+        spent = parse_money(row.get("moneySpent"))
+        sales = parse_money(row.get("ordersMoney"))
+        cart_adds = parse_int(row.get("toCart"))
+    else:
+        views = clicks = orders = 0
+        spent = sales = 0.0
+        cart_adds = 0
+
+    cpc = (spent / clicks) if clicks > 0 else 0
+    drr = (spent / sales * 100) if sales > 0 else 0
+    cr = (orders / clicks * 100) if clicks > 0 else 0
+    ctr = (clicks / views * 100) if views > 0 else 0
+
+    status_icon = "🟢 активна" if state == "CAMPAIGN_STATE_RUNNING" else "⚪ неактивна"
+
+    lines = [
+        f"📈 <b>{name}</b>",
+        f"ID: <code>{campaign_id}</code> · {status_icon}",
+        f"Дата: {today_str} (МСК)",
+        "",
+        f"👁 <b>Показы:</b> {views:,}".replace(",", " "),
+        f"🖱 <b>Клики:</b> {clicks:,}".replace(",", " "),
+        f"🛒 <b>Добавления в корзину:</b> {cart_adds}",
+        f"📦 <b>Заказы:</b> {orders}",
+        f"💰 <b>Расход за сегодня:</b> {spent:,.2f} ₽",
+        "",
+        "──────────────",
+        f"📊 CTR: <b>{ctr:.2f}%</b>",
+        f"💵 CPC: {cpc:,.2f} ₽",
+        f"📈 Конверсия: {cr:.1f}%",
+        f"💰 Выручка: {sales:,.2f} ₽",
+        f"📉 ДРР: <b>{drr:.1f}%</b>",
+    ]
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"stats:{campaign_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="stats_menu:0")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+    ])
+    return "\n".join(lines), keyboard
+
+
+# ---------- СТАВКИ ----------
+async def build_bids_menu_keyboard(page: int):
+    try:
+        campaigns = await get_campaigns()
+    except Exception as e:
+        return f"❌ Ошибка получения кампаний: {e}", None
+
+    filtered = [c for c in campaigns if c.get("PaymentType") == "CPC"]
+    now = datetime.now(timezone.utc)
+    filtered.sort(key=lambda c: campaign_priority(c, now))
+
+    total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    chunk = filtered[start:start + PAGE_SIZE]
+
+    buttons = []
+    for c in chunk:
+        cid = str(c.get("id"))
+        title = c.get("title") or c.get("advObjectType") or "Кампания"
+        if len(title) > 28:
+            title = title[:25] + "..."
+        state = c.get("state")
+        icon = "🟢" if state == "CAMPAIGN_STATE_RUNNING" else "⚪"
+        text = f"{icon} {title}"
+        buttons.append([InlineKeyboardButton(text=text[:64], callback_data=f"bids:{cid}:0")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"bids_menu:{page-1}"))
+    else:
+        nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"bids_menu:{page+1}"))
+    else:
+        nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
+    buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")])
+
+    text = (
+        f"💰 <b>Настройка ставок</b>\n\n"
+        f"Выбери кампанию, чтобы посмотреть ставки по её SKU.\n\n"
+        f"Страница {page+1}/{total_pages}"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def build_bids_view_keyboard(campaign_id: str, page: int):
+    try:
+        skus = await get_campaign_skus(int(campaign_id))
+    except Exception as e:
+        return f"❌ Ошибка: {e}", None
+
+    if not skus:
+        return (
+            f"⚠️ Не удалось получить SKU для кампании <b>{campaign_id}</b>.\n\n"
+            f"Список пуст.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ К списку кампаний", callback_data="bids_menu:0")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ])
+        )
+
+    camp_name = f"ID {campaign_id}"
+    try:
+        campaigns = await get_campaigns()
+        camp = next((c for c in campaigns if str(c.get("id")) == campaign_id), None)
+        if camp:
+            camp_name = camp.get("title") or camp_name
+    except Exception:
+        pass
+
+    total_pages = max(1, (len(skus) + BID_PAGE_SIZE - 1) // BID_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * BID_PAGE_SIZE
+    chunk = skus[start:start + BID_PAGE_SIZE]
+
+    buttons = []
+    for p in chunk:
+        sku = p["sku"]
+        title = p["title"]
+        if len(title) > 22:
+            title = title[:19] + "..."
+        bid = p["bid"]
+
+        text = f"✏️ {title} — {bid:.2f} ₽"
+        buttons.append([
+            InlineKeyboardButton(
+                text=text[:64],
+                callback_data=f"setbid:{campaign_id}:{sku}"
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"bids:{campaign_id}:{page-1}"))
+    else:
+        nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"bids:{campaign_id}:{page+1}"))
+    else:
+        nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
+    buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"bids:{campaign_id}:0")])
+    buttons.append([InlineKeyboardButton(text="⬅️ К списку кампаний", callback_data="bids_menu:0")])
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")])
+
+    text = (
+        f"💰 <b>{camp_name}</b> (ID: {campaign_id})\n"
+        f"Всего SKU: <b>{len(skus)}</b>, страница {page+1}/{total_pages}\n\n"
+        f"Нажми на <b>товар</b>, чтобы изменить ставку клика."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
+async def do_period(days: int) -> str:
+    date_to_msk = datetime.now(MOSCOW_TZ).date()
+    date_from_msk = date_to_msk - timedelta(days=days - 1)
+    rows = await get_daily_stats(date_from_msk.isoformat(), date_to_msk.isoformat())
+    if days == 1:
+        title = f"Расходы за сегодня ({date_to_msk.isoformat()}, МСК)"
+    elif days == 7:
+        title = "Расходы за 7 дней (МСК)"
+    elif days == 30:
+        title = "Расходы за месяц (МСК)"
+    else:
+        title = f"Расходы за {days} дней (МСК)"
+    return format_daily_report(rows, title)
 
 
 # ---------- КОМАНДЫ ----------
@@ -442,11 +739,11 @@ async def cmd_start(msg: Message):
         )
         return
     await msg.answer(
-        "Привет! Я слежу за рекламными расходами Ozon.\n\n"
-        "Команды:\n"
-        "/today — расходы за сегодня (МСК)\n"
-        "/week — расходы за 7 дней\n"
-        "/campaigns — список кампаний: включить / выключить / лимит"
+        "👋 <b>Привет!</b>\n\n"
+        "Я помогаю следить за рекламными расходами Ozon.\n"
+        "Выбери, что тебя интересует:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="HTML"
     )
 
 
@@ -455,27 +752,23 @@ async def cmd_today(msg: Message):
     if not has_access(msg.from_user.id):
         return
     try:
-        today = datetime.now(MOSCOW_TZ).date().isoformat()
-        rows = await get_daily_stats(today, today)
+        text = await do_period(1)
     except Exception as e:
         await msg.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
         return
-    title = f"Расходы за сегодня ({datetime.now(MOSCOW_TZ).date().isoformat()}, МСК)"
-    await msg.answer(format_daily_report(rows, title), parse_mode="HTML")
+    await msg.answer(text, parse_mode="HTML", reply_markup=back_to_menu_keyboard())
 
 
 @dp.message(Command("week"))
 async def cmd_week(msg: Message):
     if not has_access(msg.from_user.id):
         return
-    date_to_msk = datetime.now(MOSCOW_TZ).date()
-    date_from_msk = date_to_msk - timedelta(days=6)
     try:
-        rows = await get_daily_stats(date_from_msk.isoformat(), date_to_msk.isoformat())
+        text = await do_period(7)
     except Exception as e:
         await msg.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
         return
-    await msg.answer(format_daily_report(rows, "Расходы за 7 дней (МСК)"), parse_mode="HTML")
+    await msg.answer(text, parse_mode="HTML", reply_markup=back_to_menu_keyboard())
 
 
 @dp.message(Command("campaigns"))
@@ -489,7 +782,207 @@ async def cmd_campaigns(msg: Message):
         await msg.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-# ---------- КНОПКИ ----------
+# ---------- ГЛАВНОЕ МЕНЮ ----------
+@dp.callback_query(F.data == "menu:home")
+async def cb_menu_home(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(
+            "👋 <b>Главное меню</b>\n\nВыбери, что тебя интересует:",
+            reply_markup=main_menu_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "menu:stats")
+async def cb_menu_stats(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(
+            "📊 <b>Статистика</b>\n\nВыбери период:",
+            reply_markup=stats_period_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("stats_period:"))
+async def cb_stats_period(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, days_str = cb.data.split(":")
+        days = int(days_str)
+    except Exception:
+        days = 1
+
+    await cb.answer("Загружаю...")
+    try:
+        text = await do_period(days)
+        await cb.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад к периодам", callback_data="menu:stats")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ])
+        )
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+
+@dp.callback_query(F.data == "menu:balance")
+async def cb_menu_balance(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(
+            "💳 <b>Баланс</b>\n\nВыбери, что тебя интересует:",
+            reply_markup=balance_menu_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "balance:current")
+async def cb_balance_current(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    await cb.answer("Загружаю баланс...")
+    try:
+        data = await get_balance()
+        total = data.get("total", {})
+
+        closing = total.get("closing_balance", {}) or {}
+        opening = total.get("opening_balance", {}) or {}
+        accrued = total.get("accrued", {}) or {}
+
+        closing_val = closing.get("value", 0)
+        opening_val = opening.get("value", 0)
+        accrued_val = accrued.get("value", 0)
+
+        today_str = datetime.now(MOSCOW_TZ).date().isoformat()
+
+        text = (
+            f"💰 <b>Баланс рекламного кабинета</b>\n\n"
+            f"<b>Текущий баланс:</b> {closing_val:,.2f} ₽\n"
+            f"На начало периода: {opening_val:,.2f} ₽\n"
+            f"Начислено: {accrued_val:,.2f} ₽\n\n"
+            f"<i>Данные на {today_str} (МСК)</i>"
+        )
+        await cb.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="balance:current")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ]),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await cb.message.edit_text(
+            f"❌ Не удалось получить баланс.\n\n"
+            f"Ошибка: <code>{e}</code>\n\n"
+            f"Проверь ключи <code>OZON_SELLER_CLIENT_ID</code> и "
+            f"<code>OZON_SELLER_API_KEY</code> в <code>.env</code>.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Повторить", callback_data="balance:current")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
+            ]),
+            parse_mode="HTML"
+        )
+
+
+@dp.callback_query(F.data == "balance:expenses")
+async def cb_balance_expenses(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(
+            "📊 <b>Расходы</b>\n\nВыбери период:",
+            reply_markup=balance_expenses_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("balance_period:"))
+async def cb_balance_period(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, days_str = cb.data.split(":")
+        days = int(days_str)
+    except Exception:
+        days = 1
+
+    await cb.answer("Загружаю...")
+    try:
+        text = await do_period(days)
+        await cb.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад к периодам", callback_data="balance:expenses")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ])
+        )
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+
+@dp.callback_query(F.data == "menu:campaigns")
+async def cb_menu_campaigns(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    await cb.answer("Загружаю...")
+    try:
+        text, kb = await build_campaigns_keyboard("cpc", 0)
+        if kb is None:
+            await cb.message.edit_text(text)
+        else:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+
+@dp.callback_query(F.data == "menu:bids")
+async def cb_menu_bids(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    await cb.answer("Загружаю...")
+    try:
+        text, kb = await build_bids_menu_keyboard(0)
+        if kb is None:
+            await cb.message.edit_text(text)
+        else:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+
+# ---------- КНОПКИ КАМПАНИЙ ----------
 @dp.callback_query(F.data == "noop")
 async def cb_noop(cb: CallbackQuery):
     await cb.answer()
@@ -539,6 +1032,240 @@ async def cb_limits_menu(cb: CallbackQuery):
     await cb.answer()
 
 
+@dp.callback_query(F.data.startswith("stats_menu:"))
+async def cb_stats_menu(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, page_str = cb.data.split(":")
+        page = int(page_str)
+    except Exception:
+        page = 0
+
+    text, kb = await build_stats_menu_keyboard(page)
+    if kb is None:
+        await cb.answer(text, show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("stats:"))
+async def cb_stats_view(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    cid = cb.data.split(":", 1)[1]
+    await cb.answer("Загружаю...")
+    try:
+        text, kb = await build_campaign_stats_view(cid)
+        if kb is None:
+            await cb.message.edit_text(text)
+        else:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+
+# ---------- СТАВКИ: КНОПКИ ----------
+@dp.callback_query(F.data.startswith("bids_menu:"))
+async def cb_bids_menu(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, page_str = cb.data.split(":")
+        page = int(page_str)
+    except Exception:
+        page = 0
+
+    text, kb = await build_bids_menu_keyboard(page)
+    if kb is None:
+        await cb.answer(text, show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("bids:"))
+async def cb_bids_view(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, campaign_id, page_str = cb.data.split(":")
+        page = int(page_str)
+    except Exception:
+        await cb.answer("Ошибка разбора данных", show_alert=True)
+        return
+
+    await cb.answer("Загружаю SKU...")
+    try:
+        text, kb = await build_bids_view_keyboard(campaign_id, page)
+        if kb is None:
+            await cb.message.edit_text(text)
+        else:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("setbid:"))
+async def cb_setbid(cb: CallbackQuery, state: FSMContext):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, campaign_id, sku = cb.data.split(":", 2)
+    except Exception:
+        await cb.answer("Ошибка разбора данных", show_alert=True)
+        return
+
+    await state.update_data(campaign_id=campaign_id, sku=sku)
+    await state.set_state(BidForm.waiting_amount)
+
+    await cb.message.answer(
+        f"✏️ <b>Изменение ставки</b>\n"
+        f"Кампания ID: <code>{campaign_id}</code>\n"
+        f"SKU: <code>{sku}</code>\n\n"
+        f"Введи новую ставку в <b>рублях</b> (например: <code>2.6</code> или <code>10</code>).\n\n"
+        f"Отмена — /cancel",
+        parse_mode="HTML"
+    )
+    await cb.answer()
+
+
+@dp.message(BidForm.waiting_amount)
+async def process_bid_amount(msg: Message, state: FSMContext):
+    if not has_access(msg.from_user.id):
+        return
+
+    data = await state.get_data()
+    campaign_id = data.get("campaign_id")
+    sku = data.get("sku")
+
+    text_raw = msg.text.strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = float(text_raw)
+    except ValueError:
+        await msg.answer("❌ Введи число, например: <code>2.6</code>", parse_mode="HTML")
+        return
+
+    if amount <= 0:
+        await msg.answer("❌ Ставка должна быть больше 0.")
+        return
+
+    try:
+        await set_campaign_bid(int(campaign_id), sku, amount)
+    except Exception as e:
+        await state.clear()
+        await msg.answer(f"❌ Не удалось обновить: <code>{e}</code>", parse_mode="HTML")
+        return
+
+    await state.clear()
+    await msg.answer(
+        f"✅ Ставка <b>{amount:.2f} ₽</b> установлена для SKU <code>{sku}</code>.",
+        parse_mode="HTML"
+    )
+
+    try:
+        text_view, kb = await build_bids_view_keyboard(campaign_id, 0)
+        if kb:
+            await msg.answer(text_view, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+# ---------- ЛИМИТЫ ----------
+@dp.callback_query(F.data.startswith("limit:"))
+async def cb_limit(cb: CallbackQuery, state: FSMContext):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    cid = cb.data.split(":", 1)[1]
+    current_limit = get_limit(cid)
+
+    try:
+        campaigns = await get_campaigns()
+        name = next(
+            (c.get("title") or cid for c in campaigns if str(c.get("id")) == cid),
+            cid
+        )
+    except Exception:
+        name = cid
+
+    await state.update_data(campaign_id=cid)
+    await state.set_state(LimitForm.waiting_amount)
+
+    await cb.message.answer(
+        f"⚙️ Кампания: <b>{name}</b> (ID: {cid})\n\n"
+        f"Введи дневной лимит в рублях.\n"
+        f"Текущий лимит: <b>{current_limit:,.2f} ₽</b>\n"
+        f"Чтобы убрать лимит — отправь <code>0</code>.\n\n"
+        f"Отмена — /cancel",
+        parse_mode="HTML"
+    )
+    await cb.answer()
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(msg: Message, state: FSMContext):
+    if await state.get_state() is None:
+        return
+    await state.clear()
+    await msg.answer("❌ Действие отменено.")
+
+
+@dp.message(LimitForm.waiting_amount)
+async def process_limit_amount(msg: Message, state: FSMContext):
+    if not has_access(msg.from_user.id):
+        return
+
+    data = await state.get_data()
+    cid = data.get("campaign_id")
+
+    text = msg.text.strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = float(text)
+    except ValueError:
+        await msg.answer(
+            "❌ Не понял сумму. Введи число, например: <code>500</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    if amount < 0:
+        await msg.answer("❌ Сумма не может быть отрицательной.")
+        return
+
+    set_limit(cid, amount)
+    await state.clear()
+
+    if amount == 0:
+        await msg.answer(f"✅ Лимит для кампании <b>{cid}</b> убран.", parse_mode="HTML")
+    else:
+        await msg.answer(
+            f"✅ Лимит <b>{amount:,.2f} ₽</b> установлен для кампании <b>{cid}</b>.",
+            parse_mode="HTML"
+        )
+
+    try:
+        text, kb = await build_limits_keyboard(0)
+        if kb:
+            await msg.answer(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+# ---------- ON / OFF ----------
 @dp.callback_query(F.data.startswith("off:"))
 async def cb_off(cb: CallbackQuery):
     if not has_access(cb.from_user.id):
@@ -577,96 +1304,7 @@ async def cb_on(cb: CallbackQuery):
         await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
 
 
-# ---------- УСТАНОВКА ЛИМИТА ----------
-@dp.callback_query(F.data.startswith("limit:"))
-async def cb_limit(cb: CallbackQuery, state: FSMContext):
-    if not has_access(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-
-    cid = cb.data.split(":", 1)[1]
-    current_limit = get_limit(cid)
-
-    # Найдём название кампании
-    try:
-        campaigns = await get_campaigns()
-        name = next(
-            (c.get("title") or cid for c in campaigns if str(c.get("id")) == cid),
-            cid
-        )
-    except Exception:
-        name = cid
-
-    await state.update_data(campaign_id=cid)
-    await state.set_state(LimitForm.waiting_amount)
-
-    await cb.message.answer(
-        f"⚙️ Кампания: <b>{name}</b> (ID: {cid})\n\n"
-        f"Введи дневной лимит в рублях.\n"
-        f"Текущий лимит: <b>{current_limit:,.2f} ₽</b>\n"
-        f"Чтобы убрать лимит — отправь <code>0</code>.\n\n"
-        f"Отмена — /cancel",
-        parse_mode="HTML"
-    )
-    await cb.answer()
-
-
-@dp.message(Command("cancel"))
-async def cmd_cancel(msg: Message, state: FSMContext):
-    if await state.get_state() is None:
-        return
-    await state.clear()
-    await msg.answer("❌ Установка лимита отменена.")
-
-
-@dp.message(LimitForm.waiting_amount)
-async def process_limit_amount(msg: Message, state: FSMContext):
-    if not has_access(msg.from_user.id):
-        return
-
-    data = await state.get_data()
-    cid = data.get("campaign_id")
-
-    text = msg.text.strip().replace(" ", "").replace(",", ".")
-    try:
-        amount = float(text)
-    except ValueError:
-        await msg.answer(
-            "❌ Не понял сумму. Введи число, например: <code>500</code> или <code>1500.50</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    if amount < 0:
-        await msg.answer("❌ Сумма не может быть отрицательной.")
-        return
-
-    set_limit(cid, amount)
-    await state.clear()
-
-    if amount == 0:
-        await msg.answer(
-            f"✅ Лимит для кампании <b>{cid}</b> убран.\n"
-            f"Кампания больше не будет проверяться.",
-            parse_mode="HTML"
-        )
-    else:
-        await msg.answer(
-            f"✅ Лимит <b>{amount:,.2f} ₽</b> установлен для кампании <b>{cid}</b>.\n\n"
-            f"Бот проверяет расход каждые 30 минут и отключит кампанию при превышении.",
-            parse_mode="HTML"
-        )
-
-    # Обновляем экран лимитов
-    try:
-        text, kb = await build_limits_keyboard(0)
-        if kb:
-            await msg.answer(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        pass
-
-
-# ---------- ПРОВЕРКА ПОРОГОВ И ЛИМИТОВ ----------
+# ---------- ПОРОГИ И ЛИМИТЫ ----------
 async def check_thresholds():
     try:
         today_str = datetime.now(MOSCOW_TZ).date().isoformat()
@@ -674,7 +1312,6 @@ async def check_thresholds():
         agg = aggregate_daily(rows)
         total = sum(v["expense"] for v in agg.values())
 
-        # --- Пороги ---
         notified = get_notified_today()
         for threshold in THRESHOLDS:
             if total >= threshold and threshold not in notified:
@@ -685,9 +1322,7 @@ async def check_thresholds():
                     except Exception:
                         pass
                 mark_notified(threshold)
-                print(f"Порог {threshold} — уведомление отправлено. Расход: {total:.2f}")
 
-        # --- Лимиты ---
         limits = load_limits()
         if not limits:
             return
@@ -701,7 +1336,6 @@ async def check_thresholds():
         for cid_str, limit in list(limits.items()):
             if not limit or limit <= 0:
                 continue
-
             spent = agg.get(cid_str, {}).get("expense", 0.0)
             if spent >= limit:
                 name = camp_names.get(cid_str, cid_str)
@@ -715,7 +1349,6 @@ async def check_thresholds():
                             pass
                     limits[cid_str] = 0
                     save_limits(limits)
-                    print(f"Кампания {cid_str} отключена (лимит {limit}, расход {spent:.2f})")
                 except Exception as e:
                     print(f"Не удалось отключить кампанию {cid_str}: {e}")
     except Exception as e:
